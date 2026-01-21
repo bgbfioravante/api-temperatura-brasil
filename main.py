@@ -1,144 +1,315 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import requests
+from typing import Dict, List, Optional, Tuple
+import time
 
-app = FastAPI(title="API Temperatura Brasil")
+app = FastAPI(title="Temperatura Brasil (Top 100 por UF)")
 
-# Cidades com +1 milhão (lista inicial) + população estimada + coordenadas
-# Obs: População = estimativa (pode ajustar depois). Temperatura = ao vivo (Open-Meteo).
-CIDADES = {
-    "saopaulo": {"nome": "São Paulo", "uf": "SP", "lat": -23.5505, "lon": -46.6333, "pop_estimada": 12300000},
-    "riodejaneiro": {"nome": "Rio de Janeiro", "uf": "RJ", "lat": -22.9068, "lon": -43.1729, "pop_estimada": 6700000},
-    "brasilia": {"nome": "Brasília", "uf": "DF", "lat": -15.7939, "lon": -47.8828, "pop_estimada": 3000000},
-    "salvador": {"nome": "Salvador", "uf": "BA", "lat": -12.9777, "lon": -38.5016, "pop_estimada": 2900000},
-    "fortaleza": {"nome": "Fortaleza", "uf": "CE", "lat": -3.7319, "lon": -38.5267, "pop_estimada": 2700000},
-    "belohorizonte": {"nome": "Belo Horizonte", "uf": "MG", "lat": -19.9167, "lon": -43.9345, "pop_estimada": 2500000},
-    "manaus": {"nome": "Manaus", "uf": "AM", "lat": -3.1190, "lon": -60.0217, "pop_estimada": 2200000},
-    "curitiba": {"nome": "Curitiba", "uf": "PR", "lat": -25.4284, "lon": -49.2733, "pop_estimada": 1900000},
-    "recife": {"nome": "Recife", "uf": "PE", "lat": -8.0476, "lon": -34.8770, "pop_estimada": 1600000},
-    "goiania": {"nome": "Goiânia", "uf": "GO", "lat": -16.6869, "lon": -49.2648, "pop_estimada": 1500000},
-    "belem": {"nome": "Belém", "uf": "PA", "lat": -1.4558, "lon": -48.4902, "pop_estimada": 1500000},
-    "portoalegre": {"nome": "Porto Alegre", "uf": "RS", "lat": -30.0346, "lon": -51.2177, "pop_estimada": 1400000},
-    "guarulhos": {"nome": "Guarulhos", "uf": "SP", "lat": -23.4543, "lon": -46.5337, "pop_estimada": 1400000},
-    "campinas": {"nome": "Campinas", "uf": "SP", "lat": -22.9056, "lon": -47.0608, "pop_estimada": 1200000},
-    "saoluis": {"nome": "São Luís", "uf": "MA", "lat": -2.5307, "lon": -44.3068, "pop_estimada": 1100000},
-    "saogoncalo": {"nome": "São Gonçalo", "uf": "RJ", "lat": -22.8268, "lon": -43.0634, "pop_estimada": 1100000},
-    "maceio": {"nome": "Maceió", "uf": "AL", "lat": -9.6658, "lon": -35.7353, "pop_estimada": 1000000},
-    "duquedecaxias": {"nome": "Duque de Caxias", "uf": "RJ", "lat": -22.7858, "lon": -43.3117, "pop_estimada": 1000000},
-}
+# =========================
+# CONFIG
+# =========================
+REFRESH_SECONDS = 10  # atualiza a cada 10 segundos (contador regressivo usa isso)
+TOP_N = 100           # 100 maiores cidades por estado
 
+IBGE_LOCALIDADES = "https://servicodados.ibge.gov.br/api/v1/localidades"
+IBGE_INDICADORES = "https://servicodados.ibge.gov.br/api/v1/pesquisas/indicadores"
+IND_POP_RESIDENTE = 29171  # indicador bastante usado como "População residente" (Cidades@)
 
-def buscar_temperatura(lat: float, lon: float) -> float | None:
-    url = (
-        "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat}&longitude={lon}"
-        "&current=temperature_2m"
-        "&timezone=auto"
-    )
-    r = requests.get(url, timeout=15)
+OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+
+# caches em memória (pra ficar rápido no Render Free)
+CACHE_UFS: Optional[dict] = None
+CACHE_TOP100: Dict[str, dict] = {}   # uf -> {"ts":..., "data":[...]}
+CACHE_COORDS: Dict[str, Tuple[float, float]] = {}  # "nome|uf" -> (lat, lon)
+
+# =========================
+# HELPERS
+# =========================
+def http_get_json(url: str, params: dict | None = None, timeout: int = 30):
+    r = requests.get(url, params=params, timeout=timeout)
     r.raise_for_status()
-    dados = r.json()
-    return dados.get("current", {}).get("temperature_2m")
+    return r.json()
 
+def get_ufs_with_regions() -> List[dict]:
+    """
+    Retorna lista de UFs com regiao (nome), sigla, nome
+    Cacheia em memória.
+    """
+    global CACHE_UFS
+    if CACHE_UFS is not None:
+        return CACHE_UFS["ufs"]
 
-@app.get("/")
-def home():
-    return {"status": "API de temperatura do Brasil ativa"}
+    estados = http_get_json(f"{IBGE_LOCALIDADES}/estados", timeout=30)
+    ufs = []
+    for e in estados:
+        reg = (e.get("regiao") or {}).get("nome")
+        ufs.append({"sigla": e.get("sigla"), "nome": e.get("nome"), "regiao": reg})
 
+    # ordena
+    ufs.sort(key=lambda x: (x["regiao"] or "", x["sigla"] or ""))
+    CACHE_UFS = {"ufs": ufs, "ts": time.time()}
+    return ufs
 
-@app.get("/cidades")
-def listar_cidades():
-    cidades = []
-    for slug, info in CIDADES.items():
-        cidades.append(
-            {
-                "slug": slug,
-                "nome": info["nome"],
-                "uf": info["uf"],
-                "pop_estimada": info["pop_estimada"],
-            }
-        )
-    cidades.sort(key=lambda x: x["pop_estimada"], reverse=True)
-    return {"total": len(cidades), "cidades": cidades}
+def get_municipios_uf(uf: str) -> List[dict]:
+    """
+    Lista todos os municípios de uma UF (IBGE Localidades).
+    Cada item tem id e nome.
+    """
+    uf = uf.upper()
+    return http_get_json(f"{IBGE_LOCALIDADES}/estados/{uf}/municipios", timeout=40)
 
+def get_populacao_municipio(mun_id: int) -> Optional[int]:
+    """
+    Busca população (indicador 29171) para um município via API de indicadores do IBGE.
+    Tenta pegar o valor mais recente disponível na resposta.
+    """
+    try:
+        data = http_get_json(f"{IBGE_INDICADORES}/{IND_POP_RESIDENTE}/resultados/{mun_id}", timeout=30)
+        if not data:
+            return None
 
-@app.get("/temperatura/{cidade}")
-def temperatura_uma(cidade: str):
-    cidade = cidade.lower()
-    if cidade not in CIDADES:
-        return {"erro": "Cidade não encontrada", "dica": "Use /cidades para ver as disponíveis."}
+        # Estrutura comum: data[0]["res"][0]["res"] é um dict {ano: valor_str}
+        series = None
+        if isinstance(data, list) and data:
+            item0 = data[0]
+            res = item0.get("res")
+            if isinstance(res, list) and res:
+                series = res[0].get("res")
 
-    info = CIDADES[cidade]
-    temp = buscar_temperatura(info["lat"], info["lon"])
+        if not isinstance(series, dict) or not series:
+            return None
 
-    return {
-        "slug": cidade,
-        "cidade": info["nome"],
-        "uf": info["uf"],
-        "pop_estimada": info["pop_estimada"],
-        "temperatura_c": temp,
-        "unidade": "°C",
+        # pega o ano mais recente
+        anos = sorted(series.keys())
+        ultimo_ano = anos[-1]
+        val = series.get(ultimo_ano)
+
+        if val is None:
+            return None
+
+        # alguns valores vêm como string com separadores
+        val_str = str(val).strip().replace(".", "").replace(" ", "")
+        # às vezes tem vírgula decimal (não deveria pra população, mas garantimos)
+        val_str = val_str.replace(",", ".")
+        # tenta int
+        return int(float(val_str))
+    except Exception:
+        return None
+
+def geocode_latlon(nome: str, uf: str) -> Optional[Tuple[float, float]]:
+    """
+    Usa geocoding do Open-Meteo para achar lat/lon.
+    Cacheia em memória.
+    """
+    key = f"{nome}|{uf}".lower()
+    if key in CACHE_COORDS:
+        return CACHE_COORDS[key]
+
+    # query que costuma funcionar bem
+    q = f"{nome}, {uf}, Brazil"
+    params = {"name": q, "count": 1, "format": "json"}
+    try:
+        data = http_get_json(OPEN_METEO_GEOCODE, params=params, timeout=25)
+        results = data.get("results") or []
+        if not results:
+            return None
+        lat = results[0].get("latitude")
+        lon = results[0].get("longitude")
+        if lat is None or lon is None:
+            return None
+        CACHE_COORDS[key] = (float(lat), float(lon))
+        return CACHE_COORDS[key]
+    except Exception:
+        return None
+
+def batch_temperaturas(latlons: List[Tuple[float, float]]) -> List[Optional[float]]:
+    """
+    Faz 1 chamada só pro Open-Meteo com lista de coordenadas.
+    Retorna lista de temperaturas na mesma ordem.
+    """
+    if not latlons:
+        return []
+
+    lats = ",".join([str(x[0]) for x in latlons])
+    lons = ",".join([str(x[1]) for x in latlons])
+
+    params = {
+        "latitude": lats,
+        "longitude": lons,
+        "current": "temperature_2m",
+        "timezone": "auto",
     }
 
+    try:
+        data = http_get_json(OPEN_METEO_FORECAST, params=params, timeout=35)
+        cur = data.get("current") or {}
 
-@app.get("/temperaturas")
-def temperaturas_todas():
-    resultados = []
-    for slug, info in CIDADES.items():
-        try:
-            temp = buscar_temperatura(info["lat"], info["lon"])
-        except Exception:
-            temp = None
+        temps = cur.get("temperature_2m")
+        # Quando é lista de coordenadas, normalmente vem array
+        if isinstance(temps, list):
+            out = []
+            for t in temps:
+                out.append(None if t is None else float(t))
+            return out
 
-        resultados.append(
-            {
-                "slug": slug,
-                "cidade": info["nome"],
-                "uf": info["uf"],
-                "pop_estimada": info["pop_estimada"],
-                "temperatura_c": temp,
-                "unidade": "°C",
-            }
-        )
+        # fallback: se veio escalar (1 cidade)
+        if temps is None:
+            return [None] * len(latlons)
+        return [float(temps)] + ([None] * (len(latlons) - 1))
+    except Exception:
+        return [None] * len(latlons)
 
-    # ordena por população (para a API)
-    resultados.sort(key=lambda x: x["pop_estimada"], reverse=True)
-    return {"total": len(resultados), "resultados": resultados}
+def get_top100_cidades_uf(uf: str) -> List[dict]:
+    """
+    Monta lista das TOP 100 cidades do estado por população (IBGE).
+    Cacheia por algumas horas pra não ficar pesado.
+    """
+    uf = uf.upper()
 
+    # cache por 12h
+    cached = CACHE_TOP100.get(uf)
+    if cached and (time.time() - cached["ts"] < 12 * 3600):
+        return cached["data"]
 
+    municipios = get_municipios_uf(uf)
+
+    # busca população (isso é pesado, mas só na primeira vez por UF por 12h)
+    items = []
+    for m in municipios:
+        mid = m.get("id")
+        nome = m.get("nome")
+        if mid is None or nome is None:
+            continue
+        pop = get_populacao_municipio(int(mid))
+        if pop is None:
+            continue
+        items.append({"id": int(mid), "nome": nome, "uf": uf, "pop": pop})
+
+    # ordena por população desc e pega top 100
+    items.sort(key=lambda x: x["pop"], reverse=True)
+    top = items[:TOP_N]
+
+    # garante coordenadas (geocoding) e guarda no cache
+    # (coordenadas também ficam em cache separado)
+    out = []
+    for it in top:
+        coords = geocode_latlon(it["nome"], uf)
+        if coords is None:
+            # ainda assim mantemos, mas sem coordenadas/temperatura
+            out.append({**it, "lat": None, "lon": None})
+        else:
+            out.append({**it, "lat": coords[0], "lon": coords[1]})
+
+    CACHE_TOP100[uf] = {"ts": time.time(), "data": out}
+    return out
+
+# =========================
+# API ROUTES
+# =========================
+@app.get("/")
+def home():
+    return {"status": "API ativa", "dica": "Acesse /app"}
+
+@app.get("/ufs")
+def ufs():
+    return {"total": len(get_ufs_with_regions()), "ufs": get_ufs_with_regions()}
+
+@app.get("/top100")
+def top100(uf: str):
+    data = get_top100_cidades_uf(uf)
+    return {"uf": uf.upper(), "total": len(data), "cidades": data}
+
+@app.get("/temps_top100")
+def temps_top100(uf: str):
+    """
+    Retorna TOP 100 do estado com temperaturas ao vivo (1 chamada batch).
+    """
+    uf = uf.upper()
+    top = get_top100_cidades_uf(uf)
+
+    latlons = []
+    idx_map = []  # quais indices têm coords
+    for i, it in enumerate(top):
+        if it.get("lat") is not None and it.get("lon") is not None:
+            latlons.append((it["lat"], it["lon"]))
+            idx_map.append(i)
+
+    temps = batch_temperaturas(latlons)
+
+    # monta resposta alinhada com top
+    out = []
+    j = 0
+    for i, it in enumerate(top):
+        t = None
+        if i in idx_map:
+            t = temps[j] if j < len(temps) else None
+            j += 1
+
+        out.append({
+            "nome": it["nome"],
+            "uf": it["uf"],
+            "pop": it["pop"],
+            "temperatura_c": t,
+        })
+
+    return {"uf": uf, "total": len(out), "resultados": out}
+
+# =========================
+# APP (HTML)
+# =========================
 @app.get("/app", response_class=HTMLResponse)
-def pagina_app():
-    return """
+def app_page():
+    return f"""
 <!doctype html>
 <html lang="pt-br">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Temperatura - Cidades +1 milhão</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Temperatura Brasil - Top 100 por Estado</title>
   <style>
-    body { font-family: -apple-system, system-ui, Arial; padding: 16px; }
-    h1 { margin: 0 0 10px; font-size: 22px; }
-    .muted { color: #666; font-size: 13px; }
-    button { padding: 10px 14px; font-size: 16px; border-radius: 10px; }
-
-    table { width: 100%; border-collapse: collapse; margin-top: 14px; }
-    th, td { border-bottom: 1px solid #ddd; padding: 10px; text-align: left; }
-    th { background: #f6f6f6; position: sticky; top: 0; z-index: 1; }
-
-    td.temp { font-weight: 700; }
-    tbody tr { transition: background-color 250ms ease; }
+    body {{ font-family:-apple-system,system-ui,Arial; padding:16px; }}
+    h1 {{ margin:0 0 8px; font-size:22px; }}
+    .muted {{ color:#666; font-size:13px; line-height:1.35; }}
+    .row {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }}
+    .btn {{
+      padding:9px 12px; font-size:14px; border-radius:999px;
+      border:1px solid #ddd; background:#fff; cursor:pointer;
+    }}
+    .btn.active {{ border-color:#000; background:#000; color:#fff; }}
+    .panel {{ margin-top:12px; padding:10px; border:1px solid #eee; border-radius:12px; background:#fafafa; }}
+    .panel-title {{ font-weight:700; margin-bottom:8px; }}
+    table {{ width:100%; border-collapse:collapse; margin-top:12px; }}
+    th,td {{ border-bottom:1px solid #ddd; padding:10px; text-align:left; }}
+    th {{ background:#f6f6f6; position:sticky; top:0; z-index:1; }}
+    td.temp {{ font-weight:800; }}
+    tbody tr {{ transition: background-color 200ms ease; }}
+    .right {{ margin-left:10px; }}
   </style>
 </head>
 <body>
-  <h1>Temperatura ao vivo (cidades +1 milhão)</h1>
+  <h1>Temperatura ao vivo — Top 100 por Estado</h1>
   <div class="muted">
-    Atualiza automaticamente a cada <b>2 segundos</b>. Ordem: <b>mais quente → mais frio</b>.
+    Clique em <b>Região</b> → clique em <b>Estado</b> → mostra as <b>100 maiores cidades</b> do estado (por população),
+    ordenadas da <b>mais quente</b> para a <b>mais fria</b>.
+    <br/>
+    Atualiza automaticamente a cada <b>{REFRESH_SECONDS}s</b> e as cidades mudam de posição.
   </div>
 
-  <p>
-    <button onclick="carregar(true)">🔄 Atualizar agora</button>
-    <span id="status" class="muted" style="margin-left:10px;"></span>
-  </p>
+  <div class="panel">
+    <div class="panel-title">Regiões</div>
+    <div class="row" id="regioes"></div>
+
+    <div style="height:10px;"></div>
+    <div class="panel-title">Estados</div>
+    <div class="row" id="estados"></div>
+
+    <div style="height:10px;"></div>
+    <button class="btn" onclick="carregar(true)">🔄 Atualizar agora</button>
+    <span id="status" class="muted right"></span>
+    <span id="countdown" class="muted right"></span>
+  </div>
 
   <table>
     <thead>
@@ -146,7 +317,7 @@ def pagina_app():
         <th>#</th>
         <th>Cidade</th>
         <th>UF</th>
-        <th>Habitantes (estim.)</th>
+        <th>População</th>
         <th>Temperatura (°C)</th>
       </tr>
     </thead>
@@ -154,49 +325,122 @@ def pagina_app():
   </table>
 
 <script>
-function fmtPop(n) {
-  return Number(n).toLocaleString("pt-BR");
-}
+const REGIOES = ["Sul","Sudeste","Centro-Oeste","Norte","Nordeste"];
+const REFRESH_SECONDS = {REFRESH_SECONDS};
 
-function fmtTemp(t) {
-  if (t === null || t === undefined) return "—";
-  return Number(t).toFixed(1);
-}
-
-// Vermelho (quente) -> Azul claro (frio) usando HSL
-function corPorTemp(temp, minT, maxT) {
-  if (temp === null || temp === undefined || isNaN(temp)) {
-    return "hsl(0 0% 96%)";
-  }
-  if (maxT === minT) {
-    return "hsl(0 85% 88%)";
-  }
-  const x = (temp - minT) / (maxT - minT);
-  const clamped = Math.max(0, Math.min(1, x));
-
-  // clamped=1 (mais quente) -> hue 0 (vermelho)
-  // clamped=0 (mais frio) -> hue 200 (azul claro)
-  const hue = 200 - (200 * clamped);
-  return `hsl(${hue} 85% 88%)`;
-}
-
+let UFS = [];
+let selecionadaRegiao = null;
+let selecionadoUF = null;
 let carregando = false;
 
-async function carregar(force=false) {
+// contador regressivo
+let remaining = REFRESH_SECONDS;
+function renderCountdown() {{
+  const el = document.getElementById("countdown");
+  if (!el) return;
+  el.textContent = `Atualiza em: ${{remaining}}s`;
+}}
+
+setInterval(() => {{
+  remaining -= 1;
+  if (remaining < 0) remaining = REFRESH_SECONDS;
+  renderCountdown();
+}}, 1000);
+
+// formatadores
+function fmtPop(n) {{
+  try {{ return Number(n).toLocaleString("pt-BR"); }} catch {{ return n; }}
+}}
+function fmtTemp(t) {{
+  if (t === null || t === undefined) return "—";
+  return Number(t).toFixed(1);
+}}
+
+// cores por temperatura: vermelho (quente) -> azul (frio) em HSL
+function corPorTemp(temp, minT, maxT) {{
+  if (temp === null || temp === undefined || isNaN(temp)) return "hsl(0 0% 96%)";
+  if (maxT === minT) return "hsl(0 85% 88%)";
+  const x = (temp - minT) / (maxT - minT);
+  const clamped = Math.max(0, Math.min(1, x));
+  const hue = 200 - (200 * clamped); // frio=200, quente=0
+  return `hsl(${{hue}} 85% 88%)`;
+}}
+
+function renderRegioes() {{
+  const root = document.getElementById("regioes");
+  root.innerHTML = "";
+  REGIOES.forEach(r => {{
+    const b = document.createElement("button");
+    b.className = "btn" + (selecionadaRegiao === r ? " active" : "");
+    b.textContent = r;
+    b.onclick = () => {{
+      selecionadaRegiao = r;
+      selecionadoUF = null;
+      renderRegioes();
+      renderEstados();
+      limparTabela("Escolha um estado.");
+    }};
+    root.appendChild(b);
+  }});
+}}
+
+function renderEstados() {{
+  const root = document.getElementById("estados");
+  root.innerHTML = "";
+
+  const lista = UFS
+    .filter(x => x.regiao === selecionadaRegiao)
+    .sort((a,b) => (a.sigla || "").localeCompare(b.sigla || ""));
+
+  lista.forEach(uf => {{
+    const b = document.createElement("button");
+    b.className = "btn" + (selecionadoUF === uf.sigla ? " active" : "");
+    b.textContent = uf.sigla;
+    b.onclick = () => {{
+      selecionadoUF = uf.sigla;
+      remaining = REFRESH_SECONDS; // reseta contador
+      renderEstados();
+      carregar(true);
+    }};
+    root.appendChild(b);
+  }});
+
+  if (lista.length === 0) {{
+    const msg = document.createElement("div");
+    msg.className = "muted";
+    msg.textContent = "Selecione uma região.";
+    root.appendChild(msg);
+  }}
+}}
+
+function limparTabela(statusMsg) {{
+  document.getElementById("tb").innerHTML = "";
+  const status = document.getElementById("status");
+  status.textContent = statusMsg || "";
+}}
+
+async function carregar(force=false) {{
   if (carregando && !force) return;
   carregando = true;
 
   const status = document.getElementById("status");
   const tb = document.getElementById("tb");
-
   status.textContent = "Carregando...";
+  tb.innerHTML = "";
 
-  try {
-    const r = await fetch("/temperaturas", { cache: "no-store" });
+  try {{
+    if (!selecionadoUF) {{
+      status.textContent = "Escolha um estado.";
+      carregando = false;
+      return;
+    }}
+
+    // pega top100 + temperaturas ao vivo
+    const r = await fetch(`/temps_top100?uf=${{encodeURIComponent(selecionadoUF)}}`, {{ cache: "no-store" }});
     const data = await r.json();
-
     let itens = data.resultados || [];
 
+    // calcula min/max (para cores)
     const tempsValidas = itens
       .map(x => x.temperatura_c)
       .filter(t => t !== null && t !== undefined && !isNaN(t))
@@ -205,44 +449,63 @@ async function carregar(force=false) {
     const minT = tempsValidas.length ? Math.min(...tempsValidas) : 0;
     const maxT = tempsValidas.length ? Math.max(...tempsValidas) : 0;
 
-    // Ordena por temperatura desc (mais quente no topo)
-    itens.sort((a, b) => {
+    // ordena por temperatura desc (mais quente no topo)
+    itens.sort((a,b) => {{
       const ta = (a.temperatura_c === null || a.temperatura_c === undefined) ? -9999 : Number(a.temperatura_c);
       const tbv = (b.temperatura_c === null || b.temperatura_c === undefined) ? -9999 : Number(b.temperatura_c);
       return tbv - ta;
-    });
+    }});
 
     const frag = document.createDocumentFragment();
-
-    itens.forEach((item, idx) => {
+    itens.forEach((item, idx) => {{
       const tr = document.createElement("tr");
-      const tempNum = (item.temperatura_c === null || item.temperatura_c === undefined) ? null : Number(item.temperatura_c);
-      tr.style.backgroundColor = corPorTemp(tempNum, minT, maxT);
+      const t = (item.temperatura_c === null || item.temperatura_c === undefined) ? null : Number(item.temperatura_c);
+      tr.style.backgroundColor = corPorTemp(t, minT, maxT);
 
       tr.innerHTML = `
-        <td><b>${idx + 1}</b></td>
-        <td>${item.cidade}</td>
-        <td>${item.uf}</td>
-        <td>${fmtPop(item.pop_estimada)}</td>
-        <td class="temp">${fmtTemp(item.temperatura_c)}</td>
+        <td><b>${{idx + 1}}</b></td>
+        <td>${{item.nome}}</td>
+        <td>${{item.uf}}</td>
+        <td>${{fmtPop(item.pop)}}</td>
+        <td class="temp">${{fmtTemp(item.temperatura_c)}}</td>
       `;
       frag.appendChild(tr);
-    });
+    }});
 
-    tb.innerHTML = "";
     tb.appendChild(frag);
 
     status.textContent = "Atualizado ✅ " + new Date().toLocaleTimeString("pt-BR");
-  } catch (e) {
+    remaining = REFRESH_SECONDS; // reseta contador quando atualiza
+    renderCountdown();
+  }} catch (e) {{
     status.textContent = "Erro ao carregar. Tente novamente.";
-  } finally {
+  }} finally {{
     carregando = false;
-  }
-}
+  }}
+}}
 
-carregar(true);
-setInterval(() => carregar(false), 2000);
+async function init() {{
+  // carrega UFs + regiões (IBGE)
+  const r = await fetch("/ufs", {{ cache: "no-store" }});
+  const data = await r.json();
+  UFS = data.ufs || [];
+
+  renderRegioes();
+  renderEstados();
+  renderCountdown();
+  limparTabela("Escolha uma região e um estado.");
+}}
+
+init();
+
+// auto refresh a cada 10s
+setInterval(() => {{
+  if (selecionadoUF) {{
+    carregar(false);
+  }}
+}}, REFRESH_SECONDS * 1000);
 </script>
 </body>
 </html>
 """
+
