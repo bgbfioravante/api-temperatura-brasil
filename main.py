@@ -27,6 +27,7 @@ CIDADES = {
     "duquedecaxias": {"nome": "Duque de Caxias", "uf": "RJ", "lat": -22.7858, "lon": -43.3117, "pop_estimada": 1000000},
 }
 
+
 def buscar_temperatura(lat: float, lon: float) -> float | None:
     url = (
         "https://api.open-meteo.com/v1/forecast"
@@ -39,25 +40,28 @@ def buscar_temperatura(lat: float, lon: float) -> float | None:
     dados = r.json()
     return dados.get("current", {}).get("temperature_2m")
 
+
 @app.get("/")
 def home():
     return {"status": "API de temperatura do Brasil ativa"}
 
-# Lista de cidades (com população)
+
 @app.get("/cidades")
 def listar_cidades():
     cidades = []
     for slug, info in CIDADES.items():
-        cidades.append({
-            "slug": slug,
-            "nome": info["nome"],
-            "uf": info["uf"],
-            "pop_estimada": info["pop_estimada"],
-        })
+        cidades.append(
+            {
+                "slug": slug,
+                "nome": info["nome"],
+                "uf": info["uf"],
+                "pop_estimada": info["pop_estimada"],
+            }
+        )
     cidades.sort(key=lambda x: x["pop_estimada"], reverse=True)
     return {"total": len(cidades), "cidades": cidades}
 
-# Temperatura de 1 cidade
+
 @app.get("/temperatura/{cidade}")
 def temperatura_uma(cidade: str):
     cidade = cidade.lower()
@@ -76,7 +80,7 @@ def temperatura_uma(cidade: str):
         "unidade": "°C",
     }
 
-# Temperatura de TODAS as cidades (tabela completa)
+
 @app.get("/temperaturas")
 def temperaturas_todas():
     resultados = []
@@ -86,19 +90,22 @@ def temperaturas_todas():
         except Exception:
             temp = None
 
-        resultados.append({
-            "slug": slug,
-            "cidade": info["nome"],
-            "uf": info["uf"],
-            "pop_estimada": info["pop_estimada"],
-            "temperatura_c": temp,
-            "unidade": "°C",
-        })
+        resultados.append(
+            {
+                "slug": slug,
+                "cidade": info["nome"],
+                "uf": info["uf"],
+                "pop_estimada": info["pop_estimada"],
+                "temperatura_c": temp,
+                "unidade": "°C",
+            }
+        )
 
+    # ordena por população (para a API)
     resultados.sort(key=lambda x: x["pop_estimada"], reverse=True)
     return {"total": len(resultados), "resultados": resultados}
 
-# Página “tipo app” (abre no Safari/Chrome e mostra tudo em tabela)
+
 @app.get("/app", response_class=HTMLResponse)
 def pagina_app():
     return """
@@ -113,21 +120,30 @@ def pagina_app():
     h1 { margin: 0 0 10px; font-size: 22px; }
     .muted { color: #666; font-size: 13px; }
     button { padding: 10px 14px; font-size: 16px; border-radius: 10px; }
+
     table { width: 100%; border-collapse: collapse; margin-top: 14px; }
     th, td { border-bottom: 1px solid #ddd; padding: 10px; text-align: left; }
-    th { background: #f6f6f6; position: sticky; top: 0; }
+    th { background: #f6f6f6; position: sticky; top: 0; z-index: 1; }
+
+    td.temp { font-weight: 700; }
+    tbody tr { transition: background-color 250ms ease; }
   </style>
 </head>
 <body>
   <h1>Temperatura ao vivo (cidades +1 milhão)</h1>
-  <div class="muted">População = estimativa. Temperatura = ao vivo (Open-Meteo).</div>
-  <p><button onclick="carregar()">🔄 Atualizar</button></p>
+  <div class="muted">
+    Atualiza automaticamente a cada <b>2 segundos</b>. Ordem: <b>mais quente → mais frio</b>.
+  </div>
 
-  <div id="status" class="muted"></div>
+  <p>
+    <button onclick="carregar(true)">🔄 Atualizar agora</button>
+    <span id="status" class="muted" style="margin-left:10px;"></span>
+  </p>
 
   <table>
     <thead>
       <tr>
+        <th>#</th>
         <th>Cidade</th>
         <th>UF</th>
         <th>Habitantes (estim.)</th>
@@ -138,35 +154,94 @@ def pagina_app():
   </table>
 
 <script>
-async function carregar() {
+function fmtPop(n) {
+  return Number(n).toLocaleString("pt-BR");
+}
+
+function fmtTemp(t) {
+  if (t === null || t === undefined) return "—";
+  return Number(t).toFixed(1);
+}
+
+// Vermelho (quente) -> Azul claro (frio) usando HSL
+function corPorTemp(temp, minT, maxT) {
+  if (temp === null || temp === undefined || isNaN(temp)) {
+    return "hsl(0 0% 96%)";
+  }
+  if (maxT === minT) {
+    return "hsl(0 85% 88%)";
+  }
+  const x = (temp - minT) / (maxT - minT);
+  const clamped = Math.max(0, Math.min(1, x));
+
+  // clamped=1 (mais quente) -> hue 0 (vermelho)
+  // clamped=0 (mais frio) -> hue 200 (azul claro)
+  const hue = 200 - (200 * clamped);
+  return `hsl(${hue} 85% 88%)`;
+}
+
+let carregando = false;
+
+async function carregar(force=false) {
+  if (carregando && !force) return;
+  carregando = true;
+
   const status = document.getElementById("status");
   const tb = document.getElementById("tb");
-  tb.innerHTML = "";
+
   status.textContent = "Carregando...";
 
   try {
-    const r = await fetch("/temperaturas");
+    const r = await fetch("/temperaturas", { cache: "no-store" });
     const data = await r.json();
 
-    data.resultados.forEach(item => {
-      const tr = document.createElement("tr");
-      const temp = (item.temperatura_c === null || item.temperatura_c === undefined) ? "—" : item.temperatura_c;
-      tr.innerHTML = `
-        <td>${item.cidade}</td>
-        <td>${item.uf}</td>
-        <td>${Number(item.pop_estimada).toLocaleString("pt-BR")}</td>
-        <td>${temp}</td>
-      `;
-      tb.appendChild(tr);
+    let itens = data.resultados || [];
+
+    const tempsValidas = itens
+      .map(x => x.temperatura_c)
+      .filter(t => t !== null && t !== undefined && !isNaN(t))
+      .map(Number);
+
+    const minT = tempsValidas.length ? Math.min(...tempsValidas) : 0;
+    const maxT = tempsValidas.length ? Math.max(...tempsValidas) : 0;
+
+    // Ordena por temperatura desc (mais quente no topo)
+    itens.sort((a, b) => {
+      const ta = (a.temperatura_c === null || a.temperatura_c === undefined) ? -9999 : Number(a.temperatura_c);
+      const tbv = (b.temperatura_c === null || b.temperatura_c === undefined) ? -9999 : Number(b.temperatura_c);
+      return tbv - ta;
     });
 
-    status.textContent = "Atualizado ✅";
+    const frag = document.createDocumentFragment();
+
+    itens.forEach((item, idx) => {
+      const tr = document.createElement("tr");
+      const tempNum = (item.temperatura_c === null || item.temperatura_c === undefined) ? null : Number(item.temperatura_c);
+      tr.style.backgroundColor = corPorTemp(tempNum, minT, maxT);
+
+      tr.innerHTML = `
+        <td><b>${idx + 1}</b></td>
+        <td>${item.cidade}</td>
+        <td>${item.uf}</td>
+        <td>${fmtPop(item.pop_estimada)}</td>
+        <td class="temp">${fmtTemp(item.temperatura_c)}</td>
+      `;
+      frag.appendChild(tr);
+    });
+
+    tb.innerHTML = "";
+    tb.appendChild(frag);
+
+    status.textContent = "Atualizado ✅ " + new Date().toLocaleTimeString("pt-BR");
   } catch (e) {
     status.textContent = "Erro ao carregar. Tente novamente.";
+  } finally {
+    carregando = false;
   }
 }
 
-carregar();
+carregar(true);
+setInterval(() => carregar(false), 2000);
 </script>
 </body>
 </html>
