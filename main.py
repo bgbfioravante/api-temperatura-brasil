@@ -212,7 +212,91 @@ def _load_data_if_needed():
 # =========================
 # TEMPERATURA (Open-Meteo) + CACHE
 # =========================
-def _fetch_temp_open_meteo(lat: float, lon: float) -> float | None:
+def def _fetch_temps_batch_open_meteo(latlons: list[tuple[float, float]]) -> list[float | None]:
+    """
+    Busca temperaturas atuais para várias coordenadas em UMA chamada (mais estável).
+    Retorna lista na mesma ordem de latlons.
+    """
+    if not latlons:
+        return []
+
+    lats = ",".join(str(lat) for lat, _ in latlons)
+    lons = ",".join(str(lon) for _, lon in latlons)
+
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lats}&longitude={lons}"
+        "&current=temperature_2m"
+        "&timezone=auto"
+    )
+    try:
+        r = session.get(url, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        temps = (data.get("current") or {}).get("temperature_2m")
+
+        # quando envia lista de coords, normalmente vem lista de temps
+        if isinstance(temps, list):
+            return [None if t is None else float(t) for t in temps]
+
+        # fallback se vier só um valor
+        if temps is None:
+            return [None] * len(latlons)
+        return [float(temps)] + ([None] * (len(latlons) - 1))
+    except Exception:
+        return [None] * len(latlons)
+
+
+def _get_temps_for_cities(cities: list[dict]) -> list[dict]:
+    """
+    Usa cache + 1 chamada batch para buscar as temperaturas faltantes.
+    """
+    now = time.time()
+
+    # 1) separa quem tem cache válido e quem precisa buscar
+    results = [None] * len(cities)
+    to_fetch = []
+    to_fetch_idx = []
+
+    with _temp_lock:
+        for i, c in enumerate(cities):
+            cid = c["id"]
+            if cid in temp_cache:
+                temp, ts = temp_cache[cid]
+                if (now - ts) < TEMP_CACHE_TTL_SECONDS:
+                    results[i] = temp
+                    continue
+            # sem cache válido
+            to_fetch.append((c["lat"], c["lon"]))
+            to_fetch_idx.append(i)
+
+    # 2) busca batch só do que faltou
+    fetched = _fetch_temps_batch_open_meteo(to_fetch)
+
+    # 3) salva no cache e preenche resultados
+    with _temp_lock:
+        for j, i in enumerate(to_fetch_idx):
+            c = cities[i]
+            cid = c["id"]
+            temp = fetched[j] if j < len(fetched) else None
+            temp_cache[cid] = (temp, now)
+            results[i] = temp
+
+    # 4) monta retorno final
+    out = []
+    for i, c in enumerate(cities):
+        out.append({
+            "id": c["id"],
+            "cidade": c["nome"],
+            "uf": None,  # preenchido depois
+            "habitantes": c["pop"],
+            "lat": c["lat"],
+            "lon": c["lon"],
+            "temperatura": results[i],
+            "unidade": "°C",
+        })
+    return out
+(lat: float, lon: float) -> float | None:
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
@@ -245,7 +329,91 @@ def _get_temp_cached(city: dict) -> float | None:
 
     return temp
 
+def def _fetch_temps_batch_open_meteo(latlons: list[tuple[float, float]]) -> list[float | None]:
+    """
+    Busca temperaturas atuais para várias coordenadas em UMA chamada (mais estável).
+    Retorna lista na mesma ordem de latlons.
+    """
+    if not latlons:
+        return []
+
+    lats = ",".join(str(lat) for lat, _ in latlons)
+    lons = ",".join(str(lon) for _, lon in latlons)
+
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lats}&longitude={lons}"
+        "&current=temperature_2m"
+        "&timezone=auto"
+    )
+    try:
+        r = session.get(url, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        temps = (data.get("current") or {}).get("temperature_2m")
+
+        # quando envia lista de coords, normalmente vem lista de temps
+        if isinstance(temps, list):
+            return [None if t is None else float(t) for t in temps]
+
+        # fallback se vier só um valor
+        if temps is None:
+            return [None] * len(latlons)
+        return [float(temps)] + ([None] * (len(latlons) - 1))
+    except Exception:
+        return [None] * len(latlons)
+
+
 def _get_temps_for_cities(cities: list[dict]) -> list[dict]:
+    """
+    Usa cache + 1 chamada batch para buscar as temperaturas faltantes.
+    """
+    now = time.time()
+
+    # 1) separa quem tem cache válido e quem precisa buscar
+    results = [None] * len(cities)
+    to_fetch = []
+    to_fetch_idx = []
+
+    with _temp_lock:
+        for i, c in enumerate(cities):
+            cid = c["id"]
+            if cid in temp_cache:
+                temp, ts = temp_cache[cid]
+                if (now - ts) < TEMP_CACHE_TTL_SECONDS:
+                    results[i] = temp
+                    continue
+            # sem cache válido
+            to_fetch.append((c["lat"], c["lon"]))
+            to_fetch_idx.append(i)
+
+    # 2) busca batch só do que faltou
+    fetched = _fetch_temps_batch_open_meteo(to_fetch)
+
+    # 3) salva no cache e preenche resultados
+    with _temp_lock:
+        for j, i in enumerate(to_fetch_idx):
+            c = cities[i]
+            cid = c["id"]
+            temp = fetched[j] if j < len(fetched) else None
+            temp_cache[cid] = (temp, now)
+            results[i] = temp
+
+    # 4) monta retorno final
+    out = []
+    for i, c in enumerate(cities):
+        out.append({
+            "id": c["id"],
+            "cidade": c["nome"],
+            "uf": None,  # preenchido depois
+            "habitantes": c["pop"],
+            "lat": c["lat"],
+            "lon": c["lon"],
+            "temperatura": results[i],
+            "unidade": "°C",
+        })
+    return out
+(cities: list[dict]) -> list[dict]:
     # busca com paralelismo, respeitando cache
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
