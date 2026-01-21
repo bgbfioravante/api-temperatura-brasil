@@ -1,263 +1,270 @@
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import requests
-from typing import Dict, List, Optional, Tuple
 import time
 
-app = FastAPI(title="Temperatura Brasil (Top 100 por UF)")
+app = FastAPI(title="Temperatura Brasil — Top 50 por Estado")
 
 # =========================
 # CONFIG
 # =========================
-REFRESH_SECONDS = 10  # atualiza a cada 10 segundos (contador regressivo usa isso)
-TOP_N = 100           # 100 maiores cidades por estado
+REFRESH_SECONDS = 10  # atualiza a cada 10s
+GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
-IBGE_LOCALIDADES = "https://servicodados.ibge.gov.br/api/v1/localidades"
-IBGE_INDICADORES = "https://servicodados.ibge.gov.br/api/v1/pesquisas/indicadores"
-IND_POP_RESIDENTE = 29171  # indicador bastante usado como "População residente" (Cidades@)
+REGIOES = ["Sul", "Sudeste", "Centro-Oeste", "Norte", "Nordeste"]
 
-OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
-OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+ESTADOS_POR_REGIAO = {
+    "Sul": ["PR", "SC", "RS"],
+    "Sudeste": ["SP", "RJ", "MG", "ES"],
+    "Centro-Oeste": ["DF", "GO", "MT", "MS"],
+    "Norte": ["AC", "AP", "AM", "PA", "RO", "RR", "TO"],
+    "Nordeste": ["AL", "BA", "CE", "MA", "PB", "PE", "PI", "RN", "SE"],
+}
 
-# caches em memória (pra ficar rápido no Render Free)
-CACHE_UFS: Optional[dict] = None
-CACHE_TOP100: Dict[str, dict] = {}   # uf -> {"ts":..., "data":[...]}
-CACHE_COORDS: Dict[str, Tuple[float, float]] = {}  # "nome|uf" -> (lat, lon)
+# Código IBGE do estado (N3 no SIDRA)
+UF_TO_N3 = {
+    "RO": 11, "AC": 12, "AM": 13, "RR": 14, "PA": 15, "AP": 16, "TO": 17,
+    "MA": 21, "PI": 22, "CE": 23, "RN": 24, "PB": 25, "PE": 26, "AL": 27, "SE": 28, "BA": 29,
+    "MG": 31, "ES": 32, "RJ": 33, "SP": 35,
+    "PR": 41, "SC": 42, "RS": 43,
+    "MS": 50, "MT": 51, "GO": 52, "DF": 53
+}
 
 # =========================
-# HELPERS
+# CACHE (para não estourar APIs)
 # =========================
-def http_get_json(url: str, params: dict | None = None, timeout: int = 30):
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+CACHE = {
+    "municipios_por_uf": {},     # UF -> list[{code_ibge, nome}]
+    "pop_por_uf": {},            # UF -> dict[nome_cidade] = pop
+    "geo_por_cidade_uf": {},     # (uf, nome) -> (lat, lon)
+    "top50_por_uf": {},          # UF -> list[{nome, pop, lat, lon}]
+    "top50_last_update": {},     # UF -> timestamp
+}
 
-def get_ufs_with_regions() -> List[dict]:
+
+# =========================
+# FUNÇÕES: IBGE (municípios)
+# =========================
+def obter_municipios_ibge_por_uf(uf: str):
     """
-    Retorna lista de UFs com regiao (nome), sigla, nome
-    Cacheia em memória.
-    """
-    global CACHE_UFS
-    if CACHE_UFS is not None:
-        return CACHE_UFS["ufs"]
-
-    estados = http_get_json(f"{IBGE_LOCALIDADES}/estados", timeout=30)
-    ufs = []
-    for e in estados:
-        reg = (e.get("regiao") or {}).get("nome")
-        ufs.append({"sigla": e.get("sigla"), "nome": e.get("nome"), "regiao": reg})
-
-    # ordena
-    ufs.sort(key=lambda x: (x["regiao"] or "", x["sigla"] or ""))
-    CACHE_UFS = {"ufs": ufs, "ts": time.time()}
-    return ufs
-
-def get_municipios_uf(uf: str) -> List[dict]:
-    """
-    Lista todos os municípios de uma UF (IBGE Localidades).
-    Cada item tem id e nome.
+    IBGE Localidades: lista municípios de um estado por UF.
+    Retorna lista com nome e id (código do município).
     """
     uf = uf.upper()
-    return http_get_json(f"{IBGE_LOCALIDADES}/estados/{uf}/municipios", timeout=40)
+    if uf in CACHE["municipios_por_uf"]:
+        return CACHE["municipios_por_uf"][uf]
 
-def get_populacao_municipio(mun_id: int) -> Optional[int]:
+    # endpoint oficial de localidades (IBGE)
+    # OBS: Esse endpoint retorna municípios e ids.
+    url = f"https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    municipios = [{"code_ibge": str(m["id"]), "nome": m["nome"]} for m in data]
+    CACHE["municipios_por_uf"][uf] = municipios
+    return municipios
+
+
+# =========================
+# FUNÇÕES: POPULAÇÃO (SIDRA)
+# =========================
+def obter_populacao_sidra_por_uf(uf: str):
     """
-    Busca população (indicador 29171) para um município via API de indicadores do IBGE.
-    Tenta pegar o valor mais recente disponível na resposta.
+    Puxa população por município via API SIDRA.
+    Tabela 6579 é usada frequentemente para estimativas de população.
+    Se a API variar, a parte de 'pop' pode falhar — nesse caso eu já deixo fallback.
     """
-    try:
-        data = http_get_json(f"{IBGE_INDICADORES}/{IND_POP_RESIDENTE}/resultados/{mun_id}", timeout=30)
-        if not data:
-            return None
+    uf = uf.upper()
+    if uf in CACHE["pop_por_uf"]:
+        return CACHE["pop_por_uf"][uf]
 
-        # Estrutura comum: data[0]["res"][0]["res"] é um dict {ano: valor_str}
-        series = None
-        if isinstance(data, list) and data:
-            item0 = data[0]
-            res = item0.get("res")
-            if isinstance(res, list) and res:
-                series = res[0].get("res")
+    n3 = UF_TO_N3.get(uf)
+    if not n3:
+        return {}
 
-        if not isinstance(series, dict) or not series:
-            return None
+    # SIDRA (tentativa padrão):
+    # t/6579 (estimativas), n6 municípios "all" filtrando por n3 (UF)
+    # v/9324 (ou variável equivalente). Como pode mudar, tratamos com fallback.
+    sidra_url = f"https://apisidra.ibge.gov.br/values/t/6579/n6/all/v/all/p/last?formato=json"
+    r = requests.get(sidra_url, timeout=30)
+    r.raise_for_status()
+    arr = r.json()
 
-        # pega o ano mais recente
-        anos = sorted(series.keys())
-        ultimo_ano = anos[-1]
-        val = series.get(ultimo_ano)
+    # Filtra pelo UF dentro do campo "Município" (às vezes vem com UF), ou por código IBGE (melhor)
+    # Como o retorno do SIDRA varia, aqui a gente tenta “melhor esforço”.
+    pop_map = {}
 
-        if val is None:
-            return None
+    # arr[0] costuma ser cabeçalho
+    for row in arr[1:]:
+        # Tentativas comuns de chaves:
+        municipio = row.get("Município") or row.get("Município (Código)") or row.get("Município - código") or row.get("Município - Nome")
+        valor = row.get("Valor") or row.get("V") or row.get("valor")
 
-        # alguns valores vêm como string com separadores
-        val_str = str(val).strip().replace(".", "").replace(" ", "")
-        # às vezes tem vírgula decimal (não deveria pra população, mas garantimos)
-        val_str = val_str.replace(",", ".")
-        # tenta int
-        return int(float(val_str))
-    except Exception:
-        return None
+        # Alguns retornos trazem "Unidade da Federação (Código)"
+        uf_code = row.get("Unidade da Federação (Código)") or row.get("UF (Código)") or row.get("Unidade da Federação")
 
-def geocode_latlon(nome: str, uf: str) -> Optional[Tuple[float, float]]:
-    """
-    Usa geocoding do Open-Meteo para achar lat/lon.
-    Cacheia em memória.
-    """
-    key = f"{nome}|{uf}".lower()
-    if key in CACHE_COORDS:
-        return CACHE_COORDS[key]
+        # Se tiver UF código, usamos:
+        if uf_code and str(uf_code).strip() != str(n3):
+            continue
 
-    # query que costuma funcionar bem
-    q = f"{nome}, {uf}, Brazil"
-    params = {"name": q, "count": 1, "format": "json"}
-    try:
-        data = http_get_json(OPEN_METEO_GEOCODE, params=params, timeout=25)
-        results = data.get("results") or []
-        if not results:
-            return None
-        lat = results[0].get("latitude")
-        lon = results[0].get("longitude")
-        if lat is None or lon is None:
-            return None
-        CACHE_COORDS[key] = (float(lat), float(lon))
-        return CACHE_COORDS[key]
-    except Exception:
-        return None
+        if municipio and valor:
+            try:
+                pop = int(float(str(valor).replace(".", "").replace(",", ".")))
+                pop_map[str(municipio).strip()] = pop
+            except:
+                pass
 
-def batch_temperaturas(latlons: List[Tuple[float, float]]) -> List[Optional[float]]:
-    """
-    Faz 1 chamada só pro Open-Meteo com lista de coordenadas.
-    Retorna lista de temperaturas na mesma ordem.
-    """
-    if not latlons:
-        return []
+    CACHE["pop_por_uf"][uf] = pop_map
+    return pop_map
 
-    lats = ",".join([str(x[0]) for x in latlons])
-    lons = ",".join([str(x[1]) for x in latlons])
+
+# =========================
+# FUNÇÕES: GEO (Open-Meteo Geocoding)
+# =========================
+def geocode_city(uf: str, nome: str):
+    key = (uf.upper(), nome.lower().strip())
+    if key in CACHE["geo_por_cidade_uf"]:
+        return CACHE["geo_por_cidade_uf"][key]
 
     params = {
-        "latitude": lats,
-        "longitude": lons,
-        "current": "temperature_2m",
-        "timezone": "auto",
+        "name": nome,
+        "count": 10,
+        "language": "pt",
+        "format": "json"
     }
+    r = requests.get(GEOCODING_URL, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
 
-    try:
-        data = http_get_json(OPEN_METEO_FORECAST, params=params, timeout=35)
-        cur = data.get("current") or {}
+    # tenta escolher resultado no Brasil
+    results = data.get("results") or []
+    best = None
+    for it in results:
+        if (it.get("country_code") == "BR") or (it.get("country") == "Brazil") or (it.get("country") == "Brasil"):
+            best = it
+            break
 
-        temps = cur.get("temperature_2m")
-        # Quando é lista de coordenadas, normalmente vem array
-        if isinstance(temps, list):
-            out = []
-            for t in temps:
-                out.append(None if t is None else float(t))
-            return out
+    if not best and results:
+        best = results[0]
 
-        # fallback: se veio escalar (1 cidade)
-        if temps is None:
-            return [None] * len(latlons)
-        return [float(temps)] + ([None] * (len(latlons) - 1))
-    except Exception:
-        return [None] * len(latlons)
+    if not best:
+        CACHE["geo_por_cidade_uf"][key] = None
+        return None
 
-def get_top100_cidades_uf(uf: str) -> List[dict]:
-    """
-    Monta lista das TOP 100 cidades do estado por população (IBGE).
-    Cacheia por algumas horas pra não ficar pesado.
-    """
+    lat = best.get("latitude")
+    lon = best.get("longitude")
+    if lat is None or lon is None:
+        CACHE["geo_por_cidade_uf"][key] = None
+        return None
+
+    CACHE["geo_por_cidade_uf"][key] = (float(lat), float(lon))
+    return (float(lat), float(lon))
+
+
+# =========================
+# FUNÇÕES: TEMPERATURA (Open-Meteo Forecast)
+# =========================
+def buscar_temperatura(lat: float, lon: float):
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m",
+        "timezone": "auto"
+    }
+    r = requests.get(FORECAST_URL, params=params, timeout=20)
+    r.raise_for_status()
+    dados = r.json()
+    return dados["current"]["temperature_2m"]
+
+
+# =========================
+# MONTAR TOP 50 POR UF (cacheado)
+# =========================
+def montar_top50_uf(uf: str):
     uf = uf.upper()
 
-    # cache por 12h
-    cached = CACHE_TOP100.get(uf)
-    if cached and (time.time() - cached["ts"] < 12 * 3600):
-        return cached["data"]
+    # atualiza top50 no máximo a cada 6h (pode ajustar)
+    now = time.time()
+    last = CACHE["top50_last_update"].get(uf, 0)
+    if uf in CACHE["top50_por_uf"] and (now - last) < 6 * 3600:
+        return CACHE["top50_por_uf"][uf]
 
-    municipios = get_municipios_uf(uf)
+    municipios = obter_municipios_ibge_por_uf(uf)
+    pop_map = obter_populacao_sidra_por_uf(uf)
 
-    # busca população (isso é pesado, mas só na primeira vez por UF por 12h)
-    items = []
+    # se pop_map vier vazio (falha da SIDRA), a lista não consegue “maiores”
+    # então faz fallback por ordem alfabética (melhor do que nada)
+    lista = []
     for m in municipios:
-        mid = m.get("id")
-        nome = m.get("nome")
-        if mid is None or nome is None:
+        nome = m["nome"]
+        pop = pop_map.get(nome) or pop_map.get(f"{nome} ({uf})") or 0
+
+        geo = geocode_city(uf, nome)
+        if not geo:
             continue
-        pop = get_populacao_municipio(int(mid))
-        if pop is None:
-            continue
-        items.append({"id": int(mid), "nome": nome, "uf": uf, "pop": pop})
 
-    # ordena por população desc e pega top 100
-    items.sort(key=lambda x: x["pop"], reverse=True)
-    top = items[:TOP_N]
+        lat, lon = geo
+        lista.append({"nome": nome, "uf": uf, "pop": int(pop), "lat": lat, "lon": lon})
 
-    # garante coordenadas (geocoding) e guarda no cache
-    # (coordenadas também ficam em cache separado)
-    out = []
-    for it in top:
-        coords = geocode_latlon(it["nome"], uf)
-        if coords is None:
-            # ainda assim mantemos, mas sem coordenadas/temperatura
-            out.append({**it, "lat": None, "lon": None})
-        else:
-            out.append({**it, "lat": coords[0], "lon": coords[1]})
+    # Ordena por pop desc e pega top 50
+    lista.sort(key=lambda x: x["pop"], reverse=True)
+    top50 = lista[:50]
 
-    CACHE_TOP100[uf] = {"ts": time.time(), "data": out}
-    return out
+    CACHE["top50_por_uf"][uf] = top50
+    CACHE["top50_last_update"][uf] = now
+    return top50
+
 
 # =========================
 # API ROUTES
 # =========================
 @app.get("/")
 def home():
-    return {"status": "API ativa", "dica": "Acesse /app"}
+    return {"status": "API de temperatura do Brasil ativa"}
 
-@app.get("/ufs")
-def ufs():
-    return {"total": len(get_ufs_with_regions()), "ufs": get_ufs_with_regions()}
+@app.get("/regioes")
+def regioes():
+    return {"regioes": REGIOES}
 
-@app.get("/top100")
-def top100(uf: str):
-    data = get_top100_cidades_uf(uf)
-    return {"uf": uf.upper(), "total": len(data), "cidades": data}
+@app.get("/estados")
+def estados(regiao: str):
+    if regiao not in ESTADOS_POR_REGIAO:
+        return JSONResponse({"erro": "Região inválida"}, status_code=400)
+    return {"regiao": regiao, "estados": ESTADOS_POR_REGIAO[regiao]}
 
-@app.get("/temps_top100")
-def temps_top100(uf: str):
-    """
-    Retorna TOP 100 do estado com temperaturas ao vivo (1 chamada batch).
-    """
-    uf = uf.upper()
-    top = get_top100_cidades_uf(uf)
+@app.get("/top50")
+def top50(uf: str):
+    top = montar_top50_uf(uf)
+    return {"uf": uf.upper(), "total": len(top), "cidades": top}
 
-    latlons = []
-    idx_map = []  # quais indices têm coords
-    for i, it in enumerate(top):
-        if it.get("lat") is not None and it.get("lon") is not None:
-            latlons.append((it["lat"], it["lon"]))
-            idx_map.append(i)
+@app.get("/temperaturas")
+def temperaturas(uf: str):
+    top = montar_top50_uf(uf)
 
-    temps = batch_temperaturas(latlons)
+    resultado = []
+    for c in top:
+        try:
+            temp = buscar_temperatura(c["lat"], c["lon"])
+        except Exception:
+            temp = None
 
-    # monta resposta alinhada com top
-    out = []
-    j = 0
-    for i, it in enumerate(top):
-        t = None
-        if i in idx_map:
-            t = temps[j] if j < len(temps) else None
-            j += 1
-
-        out.append({
-            "nome": it["nome"],
-            "uf": it["uf"],
-            "pop": it["pop"],
-            "temperatura_c": t,
+        resultado.append({
+            "nome": c["nome"],
+            "uf": c["uf"],
+            "pop": c["pop"],
+            "temperatura": temp,
+            "unidade": "°C"
         })
 
-    return {"uf": uf, "total": len(out), "resultados": out}
+    # Ordena: mais quente no topo, None no fim
+    resultado.sort(key=lambda x: (x["temperatura"] is None, -(x["temperatura"] or -9999)))
+    return {"uf": uf.upper(), "total": len(resultado), "cidades": resultado}
+
 
 # =========================
-# APP (HTML)
+# APP HTML
 # =========================
 @app.get("/app", response_class=HTMLResponse)
 def app_page():
@@ -265,247 +272,234 @@ def app_page():
 <!doctype html>
 <html lang="pt-br">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Temperatura Brasil - Top 100 por Estado</title>
-  <style>
-    body {{ font-family:-apple-system,system-ui,Arial; padding:16px; }}
-    h1 {{ margin:0 0 8px; font-size:22px; }}
-    .muted {{ color:#666; font-size:13px; line-height:1.35; }}
-    .row {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }}
-    .btn {{
-      padding:9px 12px; font-size:14px; border-radius:999px;
-      border:1px solid #ddd; background:#fff; cursor:pointer;
-    }}
-    .btn.active {{ border-color:#000; background:#000; color:#fff; }}
-    .panel {{ margin-top:12px; padding:10px; border:1px solid #eee; border-radius:12px; background:#fafafa; }}
-    .panel-title {{ font-weight:700; margin-bottom:8px; }}
-    table {{ width:100%; border-collapse:collapse; margin-top:12px; }}
-    th,td {{ border-bottom:1px solid #ddd; padding:10px; text-align:left; }}
-    th {{ background:#f6f6f6; position:sticky; top:0; z-index:1; }}
-    td.temp {{ font-weight:800; }}
-    tbody tr {{ transition: background-color 200ms ease; }}
-    .right {{ margin-left:10px; }}
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Temperatura Brasil</title>
+<style>
+  body {{
+    font-family: Arial, sans-serif;
+    margin: 18px;
+  }}
+  .row {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom: 10px; }}
+  button {{
+    padding: 10px 12px;
+    border: 1px solid #ddd;
+    background: #f6f6f6;
+    border-radius: 10px;
+    cursor: pointer;
+  }}
+  button.active {{
+    background: #111;
+    color: #fff;
+  }}
+  .pill {{
+    display:inline-block;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: #eee;
+    margin-left: 8px;
+    font-size: 12px;
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+  }}
+  th, td {{
+    text-align: left;
+    padding: 10px;
+    border-bottom: 1px solid #eee;
+  }}
+  th {{
+    background: #fafafa;
+    position: sticky;
+    top: 0;
+  }}
+  .muted {{ color:#666; font-size: 13px; }}
+  .topline {{
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+  }}
+  .counter {{
+    font-weight: bold;
+  }}
+</style>
 </head>
 <body>
-  <h1>Temperatura ao vivo — Top 100 por Estado</h1>
+  <div class="topline">
+    <h2>Temperatura ao vivo — Top 50 por Estado</h2>
+    <div class="counter">Atualiza em: <span id="count">{REFRESH_SECONDS}</span>s</div>
+  </div>
   <div class="muted">
-    Clique em <b>Região</b> → clique em <b>Estado</b> → mostra as <b>100 maiores cidades</b> do estado (por população),
-    ordenadas da <b>mais quente</b> para a <b>mais fria</b>.
-    <br/>
-    Atualiza automaticamente a cada <b>{REFRESH_SECONDS}s</b> e as cidades mudam de posição.
+    Clique em uma região → escolha o estado → lista ordena do mais quente para o mais frio e atualiza automaticamente.
   </div>
 
-  <div class="panel">
-    <div class="panel-title">Regiões</div>
-    <div class="row" id="regioes"></div>
+  <h3>Regiões</h3>
+  <div class="row" id="regioes"></div>
 
-    <div style="height:10px;"></div>
-    <div class="panel-title">Estados</div>
-    <div class="row" id="estados"></div>
+  <h3>Estados <span class="pill" id="regiaoAtual">Nenhuma</span></h3>
+  <div class="row" id="estados"></div>
 
-    <div style="height:10px;"></div>
-    <button class="btn" onclick="carregar(true)">🔄 Atualizar agora</button>
-    <span id="status" class="muted right"></span>
-    <span id="countdown" class="muted right"></span>
-  </div>
+  <h3>Ranking <span class="pill" id="ufAtual">Nenhum</span></h3>
+  <div id="status" class="muted"></div>
 
   <table>
     <thead>
       <tr>
-        <th>#</th>
         <th>Cidade</th>
         <th>UF</th>
-        <th>População</th>
+        <th>Habitantes (estim.)</th>
         <th>Temperatura (°C)</th>
       </tr>
     </thead>
-    <tbody id="tb"></tbody>
+    <tbody id="tbody"></tbody>
   </table>
 
 <script>
-const REGIOES = ["Sul","Sudeste","Centro-Oeste","Norte","Nordeste"];
-const REFRESH_SECONDS = {REFRESH_SECONDS};
+  const REFRESH = {REFRESH_SECONDS};
+  let countdown = REFRESH;
+  let ufSelecionada = null;
+  let regiaoSelecionada = null;
+  let timer = null;
 
-let UFS = [];
-let selecionadaRegiao = null;
-let selecionadoUF = null;
-let carregando = false;
-
-// contador regressivo
-let remaining = REFRESH_SECONDS;
-function renderCountdown() {{
-  const el = document.getElementById("countdown");
-  if (!el) return;
-  el.textContent = `Atualiza em: ${{remaining}}s`;
-}}
-
-setInterval(() => {{
-  remaining -= 1;
-  if (remaining < 0) remaining = REFRESH_SECONDS;
-  renderCountdown();
-}}, 1000);
-
-// formatadores
-function fmtPop(n) {{
-  try {{ return Number(n).toLocaleString("pt-BR"); }} catch {{ return n; }}
-}}
-function fmtTemp(t) {{
-  if (t === null || t === undefined) return "—";
-  return Number(t).toFixed(1);
-}}
-
-// cores por temperatura: vermelho (quente) -> azul (frio) em HSL
-function corPorTemp(temp, minT, maxT) {{
-  if (temp === null || temp === undefined || isNaN(temp)) return "hsl(0 0% 96%)";
-  if (maxT === minT) return "hsl(0 85% 88%)";
-  const x = (temp - minT) / (maxT - minT);
-  const clamped = Math.max(0, Math.min(1, x));
-  const hue = 200 - (200 * clamped); // frio=200, quente=0
-  return `hsl(${{hue}} 85% 88%)`;
-}}
-
-function renderRegioes() {{
-  const root = document.getElementById("regioes");
-  root.innerHTML = "";
-  REGIOES.forEach(r => {{
-    const b = document.createElement("button");
-    b.className = "btn" + (selecionadaRegiao === r ? " active" : "");
-    b.textContent = r;
-    b.onclick = () => {{
-      selecionadaRegiao = r;
-      selecionadoUF = null;
-      renderRegioes();
-      renderEstados();
-      limparTabela("Escolha um estado.");
-    }};
-    root.appendChild(b);
-  }});
-}}
-
-function renderEstados() {{
-  const root = document.getElementById("estados");
-  root.innerHTML = "";
-
-  const lista = UFS
-    .filter(x => x.regiao === selecionadaRegiao)
-    .sort((a,b) => (a.sigla || "").localeCompare(b.sigla || ""));
-
-  lista.forEach(uf => {{
-    const b = document.createElement("button");
-    b.className = "btn" + (selecionadoUF === uf.sigla ? " active" : "");
-    b.textContent = uf.sigla;
-    b.onclick = () => {{
-      selecionadoUF = uf.sigla;
-      remaining = REFRESH_SECONDS; // reseta contador
-      renderEstados();
-      carregar(true);
-    }};
-    root.appendChild(b);
-  }});
-
-  if (lista.length === 0) {{
-    const msg = document.createElement("div");
-    msg.className = "muted";
-    msg.textContent = "Selecione uma região.";
-    root.appendChild(msg);
+  function tempColor(t) {{
+    // gradiente simples: quente = vermelho, frio = azul
+    // faixa: -5 a 40 (ajustável)
+    const min = -5, max = 40;
+    if (t === null || t === undefined) return "#ddd";
+    let x = (t - min) / (max - min);
+    x = Math.max(0, Math.min(1, x));
+    // x=1 vermelho, x=0 azul
+    const r = Math.round(255 * x);
+    const g = Math.round(80 + (120 * (1-x)));
+    const b = Math.round(255 * (1-x));
+    return `rgb(${{r}}, ${{g}}, ${{b}})`;
   }}
-}}
 
-function limparTabela(statusMsg) {{
-  document.getElementById("tb").innerHTML = "";
-  const status = document.getElementById("status");
-  status.textContent = statusMsg || "";
-}}
+  function setActive(containerId, valueAttr, value) {{
+    const el = document.getElementById(containerId);
+    Array.from(el.querySelectorAll("button")).forEach(btn => {{
+      btn.classList.toggle("active", btn.getAttribute(valueAttr) === value);
+    }});
+  }}
 
-async function carregar(force=false) {{
-  if (carregando && !force) return;
-  carregando = true;
-
-  const status = document.getElementById("status");
-  const tb = document.getElementById("tb");
-  status.textContent = "Carregando...";
-  tb.innerHTML = "";
-
-  try {{
-    if (!selecionadoUF) {{
-      status.textContent = "Escolha um estado.";
-      carregando = false;
-      return;
-    }}
-
-    // pega top100 + temperaturas ao vivo
-    const r = await fetch(`/temps_top100?uf=${{encodeURIComponent(selecionadoUF)}}`, {{ cache: "no-store" }});
+  async function carregarRegioes() {{
+    const r = await fetch("/regioes");
     const data = await r.json();
-    let itens = data.resultados || [];
-
-    // calcula min/max (para cores)
-    const tempsValidas = itens
-      .map(x => x.temperatura_c)
-      .filter(t => t !== null && t !== undefined && !isNaN(t))
-      .map(Number);
-
-    const minT = tempsValidas.length ? Math.min(...tempsValidas) : 0;
-    const maxT = tempsValidas.length ? Math.max(...tempsValidas) : 0;
-
-    // ordena por temperatura desc (mais quente no topo)
-    itens.sort((a,b) => {{
-      const ta = (a.temperatura_c === null || a.temperatura_c === undefined) ? -9999 : Number(a.temperatura_c);
-      const tbv = (b.temperatura_c === null || b.temperatura_c === undefined) ? -9999 : Number(b.temperatura_c);
-      return tbv - ta;
+    const box = document.getElementById("regioes");
+    box.innerHTML = "";
+    data.regioes.forEach(reg => {{
+      const b = document.createElement("button");
+      b.textContent = reg;
+      b.setAttribute("data-reg", reg);
+      b.onclick = () => selecionarRegiao(reg);
+      box.appendChild(b);
     }});
+  }}
 
-    const frag = document.createDocumentFragment();
-    itens.forEach((item, idx) => {{
-      const tr = document.createElement("tr");
-      const t = (item.temperatura_c === null || item.temperatura_c === undefined) ? null : Number(item.temperatura_c);
-      tr.style.backgroundColor = corPorTemp(t, minT, maxT);
+  async function selecionarRegiao(reg) {{
+    regiaoSelecionada = reg;
+    document.getElementById("regiaoAtual").textContent = reg;
+    ufSelecionada = null;
+    document.getElementById("ufAtual").textContent = "Nenhum";
+    document.getElementById("tbody").innerHTML = "";
+    document.getElementById("status").textContent = "Escolha um estado...";
 
-      tr.innerHTML = `
-        <td><b>${{idx + 1}}</b></td>
-        <td>${{item.nome}}</td>
-        <td>${{item.uf}}</td>
-        <td>${{fmtPop(item.pop)}}</td>
-        <td class="temp">${{fmtTemp(item.temperatura_c)}}</td>
-      `;
-      frag.appendChild(tr);
+    setActive("regioes", "data-reg", reg);
+    await carregarEstados(reg);
+  }}
+
+  async function carregarEstados(reg) {{
+    const r = await fetch(`/estados?regiao=${{encodeURIComponent(reg)}}`);
+    const data = await r.json();
+    const box = document.getElementById("estados");
+    box.innerHTML = "";
+    data.estados.forEach(uf => {{
+      const b = document.createElement("button");
+      b.textContent = uf;
+      b.setAttribute("data-uf", uf);
+      b.onclick = () => selecionarUF(uf);
+      box.appendChild(b);
     }});
-
-    tb.appendChild(frag);
-
-    status.textContent = "Atualizado ✅ " + new Date().toLocaleTimeString("pt-BR");
-    remaining = REFRESH_SECONDS; // reseta contador quando atualiza
-    renderCountdown();
-  }} catch (e) {{
-    status.textContent = "Erro ao carregar. Tente novamente.";
-  }} finally {{
-    carregando = false;
   }}
-}}
 
-async function init() {{
-  // carrega UFs + regiões (IBGE)
-  const r = await fetch("/ufs", {{ cache: "no-store" }});
-  const data = await r.json();
-  UFS = data.ufs || [];
+  async function selecionarUF(uf) {{
+    ufSelecionada = uf;
+    document.getElementById("ufAtual").textContent = uf;
+    setActive("estados", "data-uf", uf);
+    document.getElementById("status").textContent = "Carregando temperaturas (pode demorar um pouco na primeira vez)...";
 
-  renderRegioes();
-  renderEstados();
-  renderCountdown();
-  limparTabela("Escolha uma região e um estado.");
-}}
+    // primeira carga imediata
+    await atualizarTabela();
 
-init();
+    // reinicia contador e timer
+    countdown = REFRESH;
+    document.getElementById("count").textContent = countdown;
 
-// auto refresh a cada 10s
-setInterval(() => {{
-  if (selecionadoUF) {{
-    carregar(false);
+    if (timer) clearInterval(timer);
+    timer = setInterval(async () => {{
+      countdown -= 1;
+      if (countdown <= 0) {{
+        countdown = REFRESH;
+        await atualizarTabela();
+      }}
+      document.getElementById("count").textContent = countdown;
+    }}, 1000);
   }}
-}}, REFRESH_SECONDS * 1000);
+
+  async function atualizarTabela() {{
+    if (!ufSelecionada) return;
+    try {{
+      const r = await fetch(`/temperaturas?uf=${{encodeURIComponent(ufSelecionada)}}`);
+      const data = await r.json();
+      const tbody = document.getElementById("tbody");
+      tbody.innerHTML = "";
+
+      data.cidades.forEach(c => {{
+        const tr = document.createElement("tr");
+
+        const tdCidade = document.createElement("td");
+        tdCidade.textContent = c.nome;
+
+        const tdUF = document.createElement("td");
+        tdUF.textContent = c.uf;
+
+        const tdPop = document.createElement("td");
+        tdPop.textContent = (c.pop || 0).toLocaleString("pt-BR");
+
+        const tdTemp = document.createElement("td");
+        tdTemp.textContent = (c.temperatura === null || c.temperatura === undefined) ? "—" : c.temperatura.toFixed(1);
+        tdTemp.style.background = tempColor(c.temperatura);
+        tdTemp.style.borderRadius = "8px";
+
+        tr.appendChild(tdCidade);
+        tr.appendChild(tdUF);
+        tr.appendChild(tdPop);
+        tr.appendChild(tdTemp);
+
+        tbody.appendChild(tr);
+      }});
+
+      const okCount = data.cidades.filter(x => x.temperatura !== null && x.temperatura !== undefined).length;
+      document.getElementById("status").textContent =
+        `Atualizado ✓ (temperaturas carregadas: ${{okCount}}/${{data.cidades.length}})`;
+
+    }} catch (e) {{
+      document.getElementById("status").textContent = "Erro ao buscar dados. Tente novamente.";
+    }}
+  }}
+
+  // init
+  carregarRegioes();
+  document.getElementById("status").textContent = "Escolha uma região...";
 </script>
 </body>
 </html>
 """
 
+
+# =========================
+# health
+# =========================
+@app.get("/health")
+def health():
+    return {"ok": True}
